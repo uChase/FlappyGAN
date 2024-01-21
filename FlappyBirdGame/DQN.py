@@ -7,27 +7,31 @@ class DQN(nn.Module):
     def __init__(self, input_size, output_size):
         super(DQN, self).__init__()
         self.fc1 = nn.Linear(input_size, 64)
-        self.fc2 = nn.Linear(64, 64)
-        self.fc3 = nn.Linear(64, output_size)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc3 = nn.Linear(128, output_size)
+        self.dropout = nn.Dropout(0.2)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = torch.sigmoid(self.fc2(x))
         x = self.fc3(x)
         return x
 
 class FlappyBirdAgent:
     def __init__(self, input_size, action_space, memory_limit):
         self.model = DQN(input_size, action_space).cuda()  # Move the model to CUDA
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0006)
         self.loss_fn = nn.MSELoss()
         self.memory = []  # Memory for experience replay
         self.memory_limit = memory_limit  # Limit on memory size
-        self.gamma = 0.99  # Discount factor for future rewards
+        self.gamma = 0.99999  # Discount factor for future rewards
 
     def remember(self, state, action, next_state, reward, done):
         if len(self.memory) >= self.memory_limit:
             self.memory.pop(0)  # Remove the oldest memory if memory limit is reached
+        if done:
+            done = 1
         self.memory.append((state, action, next_state, reward, done))
 
     def select_action(self, state, epsilon):
@@ -75,15 +79,36 @@ def prepare_state(bird_y, bird_y_change, pipes):
     pipe_data = []
     for pipe_pair in pipes[:2]:  # Consider at most two pipe pairs
         bottom_pipe, top_pipe = pipe_pair[0], pipe_pair[1]
-        # Extract the y coordinates of the top of the bottom pipe and the bottom of the top pipe
-        bottom_pipe_top_y = bottom_pipe.y
-        top_pipe_bottom_y = top_pipe.bottom
-        pipe_data.extend([bottom_pipe.x, top_pipe_bottom_y, bottom_pipe_top_y])
+        # Extract coordinates for both top and bottom pipes
+        pipe_data.extend([top_pipe.x, top_pipe.y + top_pipe.height,  top_pipe.width + top_pipe.x ])
+        pipe_data.extend([bottom_pipe.x, bottom_pipe.y, bottom_pipe.x + bottom_pipe.width])
 
-    # Ensure pipe_data has enough data for two pipes
-    while len(pipe_data) < 6:
+    # Ensure pipe_data has enough data for two pipe pairs
+    while len(pipe_data) < 12:
         pipe_data.extend([0, 0, 0])  # If less than two pipes, pad with zeros
 
     # Combine all parts of the state
     state = [bird_y, bird_y_change] + pipe_data
     return state
+
+def calculate_reward(bird_y, bird_y_change, pipes, score, game_over, frame_count):
+    reward = 0
+    
+    # Reward for each frame survived
+    reward += 0.01 * frame_count
+
+    # Additional reward for each pipe passed
+    reward += score * 2
+
+    # Penalty for game over
+    if game_over:
+        reward -= 10
+
+    # Reward or penalty based on bird's position relative to the next pipe
+    if pipes:
+        next_pipe = pipes[0]
+        gap_center = next_pipe[1].bottom + (next_pipe[0].y - next_pipe[1].bottom) / 2
+        distance_to_center = abs(bird_y - gap_center)
+        reward -= distance_to_center / 100  # Penalize based on distance to center of the gap
+
+    return reward
