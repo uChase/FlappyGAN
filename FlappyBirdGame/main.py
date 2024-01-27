@@ -10,8 +10,8 @@ screen_width = 400
 screen_height = 600
 
 
-agent = DQN.FlappyBirdAgent(14, 2, 100000)
-
+# agent = DQN.FlappyBirdAgent(14, 2, 100000)
+screen_data = None
 
 epochs = 100000
 epsilon = 0.01
@@ -39,6 +39,8 @@ for epoch in range(epochs):
     # Set up the display
     screen = pygame.display.set_mode((screen_width, screen_height))
     pygame.display.set_caption('Flappy Bird')
+    bird_sprite = pygame.image.load('./FlappyBirdGame/bird.png').convert_alpha()
+    bird_sprite = pygame.transform.scale(bird_sprite, (60, 60))
 
     # Clock for delta time
 
@@ -58,8 +60,11 @@ for epoch in range(epochs):
 
     while running:
 
-        current_state = DQN.prepare_state(bird_y, bird_y_change, pipes)
-        action = agent.select_action(current_state, epsilon)
+        screen_surface = pygame.display.get_surface()
+        screen_data = pygame.surfarray.array3d(screen_surface)
+        # current_state = DQN.prepare_state(bird_y, bird_y_change, pipes)
+        # action = agent.select_action(current_state, epsilon)
+        action = 0
         if action == 1:
             bird_y_change = -jump_height
         # Handle events
@@ -99,14 +104,15 @@ for epoch in range(epochs):
 
         # Drawing
         screen.fill((255, 255, 255))  # White background
-        pygame.draw.circle(screen, (255, 200, 0), (bird_x, int(bird_y)), 16)  # Bird
+        # pygame.draw.circle(screen, (255, 200, 0), (bird_x, int(bird_y)), 16)  # Bird
 
         for pipe in pipes:
             pygame.draw.rect(screen, pipe_color, pipe[0])
             pygame.draw.rect(screen, pipe_color, pipe[1])
 
         bird_rect = pygame.Rect(bird_x - 16, bird_y - 16, 30, 30) 
-        
+        screen.blit(bird_sprite, bird_rect)
+
         for pipe in pipes:
             if bird_rect.colliderect(pipe[0]) or bird_rect.colliderect(pipe[1]):
                 game_over = True
@@ -132,12 +138,12 @@ for epoch in range(epochs):
         next_state = DQN.prepare_state(export_bird_y, export_bird_y_change, export_pipes)
         # print(f'Action: {action}')
         # print(f'Next State: {next_state}')
-        agent.remember(current_state, action, next_state, reward, game_over)
+        # agent.remember(current_state, action, next_state, reward, game_over)
 
-        agent.replay(batch_size = batch_size)
+        # agent.replay(batch_size = batch_size)
         # Check for Game Over
         if game_over:
             break
-agent.save_model('model.pt')
+# agent.save_model('model.pt')
 # Quit Pygame
 pygame.quit()
