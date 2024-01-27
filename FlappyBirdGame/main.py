@@ -10,17 +10,21 @@ screen_width = 400
 screen_height = 600
 
 
-agent = DQN.FlappyBirdAgent(14, 2, 100000)
+agent = DQN.FlappyBirdAgent(15, 2, 1000000)
 
-
-epochs = 100000
-epsilon = 0.01
+epochs = 10000
+epsilon = 0.8
 breakOut = False
-batch_size = 256
+batch_size = 512
+total_score = 0
+# agent.load_model('./FlappyBirdGame/model.pth')
 for epoch in range(epochs):
     if breakOut:
         break
     print(f'Epoch {epoch + 1}/{epochs}')
+    if epoch +1 % 100 == 0:
+        print(f'Average Score: {total_score / 100}')
+        total_score = 0
     bird_x = 50
     bird_y = 300
     bird_y_change = 0
@@ -32,8 +36,9 @@ for epoch in range(epochs):
     # Pipe Variables
     pipe_width = 70  # Width of the pipes
     pipe_color = (0, 255, 0)  # Green color for pipes
-    space_between_pipes = 150  # Space between the top and bottom pipes
+    space_between_pipes = 200  # Space between the top and bottom pipes
     pipe_frequency = 1500  # Milliseconds between new pipes
+    last_pipe = pygame.time.get_ticks()  # Time when the last pipe was created
     pipes = []  # List to store pipes
 
     # Set up the display
@@ -49,6 +54,7 @@ for epoch in range(epochs):
     export_game_over = False
 
 
+    game_overBig = False
     # Main game loop
     running = True
     score = 0
@@ -58,8 +64,9 @@ for epoch in range(epochs):
 
     while running:
 
-        current_state = DQN.prepare_state(bird_y, bird_y_change, pipes)
+        current_state = DQN.prepare_state(bird_y, bird_y_change, pipes, bird_x)
         action = agent.select_action(current_state, epsilon)
+        epsilon *= 0.8
         if action == 1:
             bird_y_change = -jump_height
         # Handle events
@@ -82,6 +89,7 @@ for epoch in range(epochs):
         # Game over condition (if the bird hits the ground or goes off screen)
         if bird_y > screen_height - 32 or bird_y < 0:
             game_over = True
+            game_overBig = True
 
 
         if frame_count % 150 == 0:
@@ -127,9 +135,11 @@ for epoch in range(epochs):
         export_bird_y_change = bird_y_change
         export_pipes = pipes
         export_game_over = game_over
-        reward = DQN.calculate_reward(bird_y, bird_y_change, pipes, score, game_over, frame_count)
+        reward = DQN.calculate_reward(export_bird_y, export_bird_y_change, export_pipes, score, export_game_over, game_overBig)
 
-        next_state = DQN.prepare_state(export_bird_y, export_bird_y_change, export_pipes)
+        next_state = DQN.prepare_state(export_bird_y, export_bird_y_change, export_pipes, bird_x)
+        # print(f'pipes: {export_pipes}')
+        # print(f'Current State: {current_state}')
         # print(f'Action: {action}')
         # print(f'Next State: {next_state}')
         agent.remember(current_state, action, next_state, reward, game_over)
@@ -138,6 +148,8 @@ for epoch in range(epochs):
         # Check for Game Over
         if game_over:
             break
-agent.save_model('model.pt')
+    total_score += score
+
+agent.save_model('model.pth')
 # Quit Pygame
 pygame.quit()
