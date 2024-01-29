@@ -6,24 +6,29 @@ import random
 class DQN(nn.Module):
     def __init__(self, input_size, output_size):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_size, 248)
-        self.fc2 = nn.Linear(248, 64)
-        self.fc3 = nn.Linear(64, output_size)
+        self.fc1 = nn.Linear(input_size, 64)
+        self.fc2 = nn.Linear(64, 128)
+        self.fc3 = nn.Linear(128, 256)
+        self.fc4 = nn.Linear(256, output_size)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
+        x = torch.relu(self.fc3(x))
+        x = self.fc4(x)
         return x
 
 class FlappyBirdAgent:
-    def __init__(self, input_size, action_space, memory_limit):
+    def __init__(self, input_size, action_space, memory_limit, EPS_START=1.0, EPS_END=0.0001, EPS_DECAY_VALUE=0.99):
         self.model = DQN(input_size, action_space).cuda()  # Move the model to CUDA
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.loss_fn = nn.MSELoss()
         self.memory = []  # Memory for experience replay
         self.memory_limit = memory_limit  # Limit on memory size
         self.gamma = 0.999  # Discount factor for future rewards
+        self.epsilon = EPS_START  
+        self.EPS_END = EPS_END
+        self.EPS_DECAY_VALUE = EPS_DECAY_VALUE
 
     def remember(self, state, action, next_state, reward, done):
         if len(self.memory) >= self.memory_limit:
@@ -32,8 +37,11 @@ class FlappyBirdAgent:
             done = 1
         self.memory.append((state, action, next_state, reward, done))
 
-    def select_action(self, state, epsilon):
-        if random.random() < epsilon:
+    def select_action(self, state):
+        if random.random() < self.epsilon:
+            if self.epsilon > self.EPS_END:
+                self.epsilon *= self.EPS_DECAY_VALUE
+            print(self.epsilon)
             return random.choice([0, 1])  # Random action (0 or 1)
         else:
             state_tensor = torch.FloatTensor(state).unsqueeze(0).cuda()  # Move the tensor to CUDA
@@ -43,6 +51,7 @@ class FlappyBirdAgent:
 
     def replay(self, batch_size):
         if len(self.memory) < batch_size:
+            print("Not enough memory to replay")
             return
 
         batch = random.sample(self.memory, batch_size)
@@ -72,64 +81,66 @@ class FlappyBirdAgent:
         self.model.load_state_dict(torch.load(filepath))
         self.model.eval()
 
-def prepare_state(bird_y, bird_y_change, pipes, bird_x):
-    # Flatten pipe coordinates
-    pipe_data = []
-    bottom_pipe = None
-    for pipe_pair in pipes[:2]:  # Consider at most two pipe pairs
-        bottom_pipe, top_pipe = pipe_pair[0], pipe_pair[1]
-        # Extract the y coordinates of the top of the bottom pipe and the bottom of the top pipe
-        bottom_pipe_top_y = bottom_pipe.y
-        top_pipe_bottom_y = top_pipe.bottom
-        pipe_data.extend([bottom_pipe.x, bottom_pipe.x + bottom_pipe.width, top_pipe_bottom_y, bottom_pipe_top_y])
+def prepare_state(bird_y, bird_y_change, bird_x, pipes, screen_width, screen_height):
+    # Initialize distances with default values (e.g., max distances)
+    dist_to_next_pipe_left = screen_width
+    dist_to_next_pipe_right = screen_width
+    dist_to_bottom_pipe_top = 100
+    dist_to_top_pipe_bottom = 100
 
-    distance_to_center = 500
-    distance_to_pipe_top = 600
-    distance_to_pipe_bottom = 100
     if pipes:
-        next_pipe = pipes[0]
-        gap_center = next_pipe[1].bottom + (next_pipe[0].y - next_pipe[1].bottom) / 2
-        distance_to_center = abs(bird_y - gap_center - 16)
-        distance_to_pipe_top = bird_y - next_pipe[1].bottom - 16
-        distance_to_pipe_bottom = next_pipe[0].y - bird_y + 16
-    # Ensure pipe_data has enough data for two pipes
-    while len(pipe_data) < 8:
-        pipe_data.extend([0, 0, 0, 0])  # If less than two pipes, pad with zeros
+        next_bottom_pipe, next_top_pipe, _ = pipes[0]
+        dist_to_next_pipe_left = max(0, next_bottom_pipe.x - bird_x - 30 )
+        dist_to_next_pipe_right = max(0, (next_bottom_pipe.x + next_bottom_pipe.width) - bird_x - 30)
+        dist_to_bottom_pipe_top = next_bottom_pipe.y - bird_y - 30
+        dist_to_top_pipe_bottom = bird_y - next_top_pipe.bottom 
+    # Normalize distances (optional, based on your scale)
+    dist_to_next_pipe_left /= screen_width
+    dist_to_next_pipe_right /= screen_width
+    dist_to_bottom_pipe_top /= screen_height
+    dist_to_top_pipe_bottom /= screen_height
+    scale_bird_y = bird_y / screen_height
+    scale_bird_y_change = bird_y_change / screen_height
 
-    state = []
-
-    if bottom_pipe:
-        state = [bird_y - 16, bird_y + 14, bottom_pipe.x - bird_x + 14, bird_y_change, distance_to_center, distance_to_pipe_top, distance_to_pipe_bottom] + pipe_data
-    else:
-        state = [bird_y - 16, bird_y + 14, 2000, bird_y_change, distance_to_center, distance_to_pipe_top, distance_to_pipe_bottom] + pipe_data
+    # State vector
+    state = [
+        scale_bird_y,
+        scale_bird_y_change,
+        dist_to_next_pipe_left,
+        dist_to_next_pipe_right,
+        dist_to_bottom_pipe_top,
+        dist_to_top_pipe_bottom,
+    ]
     return state
-def calculate_reward(bird_y, bird_y_change, pipes, score, game_over, game_overBig):
+
+def calculate_reward(bird_y, bird_y_change, pipes, score, game_over, game_overBig, frames_survived):
     reward = 0
 
     # Constant Reward for Each Frame Survived
     reward += 0.1
 
     # Reward for Each Pipe Passed
-    reward += score * 10
+    reward += score * .1
 
     if game_overBig:
-        return -1000
+        return -20
     # Penalty for Game Over
     if game_over:
-        return -100
+        return -10
 
     # Reward Based on Bird's Position Relative to the Next Pipe
     if pipes:
+        next_bottom_pipe, next_top_pipe, _ = pipes[0]
         next_pipe = pipes[0]
         gap_center = next_pipe[1].bottom + (next_pipe[0].y - next_pipe[1].bottom) / 2
-        distance_to_center = abs(bird_y - gap_center - 16)
+        distance_to_center = abs(bird_y - gap_center)
         if distance_to_center < 10:
-            reward += 10
-        elif distance_to_center < 20:
-            reward += 5
-        elif distance_to_center < 50:
-            reward += 2
-        elif distance_to_center < 100:
+            reward += .2
+        dist_to_bottom_pipe_top = next_bottom_pipe.y - bird_y - 30
+        dist_to_top_pipe_bottom = bird_y - next_top_pipe.bottom 
+        if dist_to_bottom_pipe_top > 0 and dist_to_top_pipe_bottom > 0:
             reward += 1
+        else:
+            reward -= .1
 
     return reward
