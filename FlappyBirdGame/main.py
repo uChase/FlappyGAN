@@ -13,13 +13,13 @@ episodes = []
 frames_survived = []
 
 # TO CHANGE FOR MORE EFFICIENCY, CHANGE THE COMPRESSION FACTOR, MAKE IT ONLY SAVE ON INTERVALS OF FRAMES, AND MAKE IT SAVE TO A DIFFERENT FILE EVERY TIME
-def compress_screen_data(screen_data, compression_factor=0.5):
+def compress_screen_data(screen_data, compression_factor=0.125):
 
 
     # Resize using scipy's zoom function
-    # compressed_data = zoom(screen_data, (compression_factor, compression_factor, 1), order=0)
+    compressed_data = zoom(screen_data, (compression_factor, compression_factor, 1), order=0)
 
-    return screen_data
+    return compressed_data
 
 # Initialize Pygame
 pygame.init()
@@ -42,7 +42,7 @@ epochs = 100000
 breakOut = False
 batch_size = 4000
 total_score = 0
-agent.load_model('./FlappyBirdGame/model.pt')
+# agent.load_model('./FlappyBirdGame/model.pt')
 for epoch in range(epochs):
     if breakOut:
         break
@@ -91,9 +91,9 @@ for epoch in range(epochs):
     last_passed_pipe_id = -1
 
     while running:
-        # current_screen_surface = pygame.display.get_surface()
-        # current_screen_data = pygame.surfarray.array3d(current_screen_surface)
-        # compressed_current_screen_data = compress_screen_data(current_screen_data)
+        current_screen_surface = pygame.display.get_surface()
+        current_screen_data = pygame.surfarray.array3d(current_screen_surface)
+        compressed_current_screen_data = compress_screen_data(current_screen_data)
 
         current_state = DQN.prepare_state(bird_y, bird_y_change,  bird_x, pipes, screen_width, screen_height)
         action = agent.select_action(current_state)
@@ -147,11 +147,10 @@ for epoch in range(epochs):
         bird_rect = pygame.Rect(bird_x, bird_y , 30, 30) 
 
         # Draw the rectangle (for debugging, you can comment this out later)
-        # pygame.draw.rect(screen, (255, 0, 0), bird_rect)
 
         # Draw the bird sprite so that it aligns with the bird_rect
-        bird_sprite_rect = bird_sprite.get_rect(center=bird_rect.center)
-        screen.blit(bird_sprite, bird_sprite_rect)
+        # bird_sprite_rect = bird_sprite.get_rect(center=bird_rect.center)
+        # screen.blit(bird_sprite, bird_sprite_rect)
 
 
         for pipe in pipes:
@@ -163,6 +162,13 @@ for epoch in range(epochs):
                 score += 1
                 total_score += 1
                 last_passed_pipe_id = pipe[2]
+        
+        if game_over:
+            pygame.draw.rect(screen, (0, 0, 255), bird_rect)
+            print("blue")
+        else:
+            pygame.draw.rect(screen, (255, 0, 0), bird_rect)
+
         # font = pygame.font.SysFont(None, 36)
         # score_text = font.render(f'Score: {score}', True, (0, 0, 0))
         # screen.blit(score_text, (10, 10))
@@ -186,16 +192,18 @@ for epoch in range(epochs):
         agent.remember(current_state, action, next_state, reward, game_over)
         # agent.replay(batch_size = batch_size)
         
-        # next_screen_surface = pygame.display.get_surface()
-        # next_screen_data = pygame.surfarray.array3d(next_screen_surface)
-        # compressed_next_screen_data = compress_screen_data(next_screen_data)
+        next_screen_surface = pygame.display.get_surface()
+        next_screen_data = pygame.surfarray.array3d(next_screen_surface)
+        compressed_next_screen_data = compress_screen_data(next_screen_data)
 
-        # Store the pair of frames
-        # frame_data.append((compressed_current_screen_data, action, compressed_next_screen_data, game_over))
-        # # Check for Game Over
-        # if (total_frames + 1) % 1000 == 0:
-        #     save_frame_data(frame_data, 'compressed_frame_data.npz')
-        #     frame_data.clear()
+        gOver = 0
+        if game_over:
+            gOver = 1
+        frame_data.append((compressed_current_screen_data, action, compressed_next_screen_data, gOver))
+        # Check for Game Over
+        if (total_frames + 1) % 1000 == 0:
+            save_frame_data(frame_data, 'compressed_frame_data.npz')
+            frame_data.clear()
         if game_over:
             break
     agent.replay(batch_size = batch_size)

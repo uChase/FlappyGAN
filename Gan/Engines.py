@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# THE IMAGE IS GOING TO BE 50 X 75
+
 class DynamicsEngine(nn.Module):
     def __init__(self, action_size, noise_size, memory_size, frame_channels, frame_height, frame_width, hidden_size, num_layers, output_size):
         super(DynamicsEngine, self).__init__()
@@ -62,6 +64,8 @@ class DynamicsEngine(nn.Module):
         return torch.zeros(self.num_layers, batch_size, self.hidden_size)
 
 
+
+
 class Memory(nn.Module):
     def __init__(self, action_size, hidden_size, memory_units, memory_unit_size, controller_size):
         super(Memory, self).__init__()
@@ -71,22 +75,42 @@ class Memory(nn.Module):
         # Initialize the memory
         self.memory = torch.randn(memory_units, memory_unit_size)
 
-        # Controller
-        self.controller = nn.LSTM(action_size + hidden_size, controller_size)
+        # Controller (using GRU instead of LSTM)
+        self.controller = nn.GRU(action_size + hidden_size, controller_size)
 
-        # Read and write heads (for simplicity, using a single head for each)
+        # Read and write heads
         self.read_head = nn.Linear(controller_size, memory_unit_size)
         self.write_head = nn.Linear(controller_size, memory_unit_size)
 
-    def _addressing(self, key, memory):
-        # Content-based addressing (using cosine similarity for simplicity)
+        # Additional vectors for writing and location-based addressing
+        self.add_vector = nn.Linear(controller_size, memory_unit_size)
+        self.erase_vector = nn.Linear(controller_size, memory_unit_size)
+        self.shift_vector = nn.Linear(controller_size, memory_units)  # For shifting attention
+        self.sharpening_factor = nn.Linear(controller_size, 1)  # For sharpening the distribution
+        self.interpolation_gate = nn.Linear(controller_size, 1)  # For interpolation
+
+    def _cosine_similarity(self, key, memory):
+        # Cosine similarity for content-based addressing
         key = key / (key.norm(p=2, dim=1, keepdim=True) + 1e-16)
-        memory = memory / (memory.norm(p=2, dim=2, keepdim=True) + 1e-16)
-        similarity = torch.bmm(memory, key.unsqueeze(2)).squeeze(2)
-        w = F.softmax(similarity, dim=1)
+        memory = memory / (memory.norm(p=2, dim=1, keepdim=True) + 1e-16)
+        similarity = torch.mm(memory, key.t())
+        return F.softmax(similarity, dim=1)
+
+    def _circular_convolution(self, w, s):
+        # Circular convolution for location-based addressing
+        result = torch.zeros_like(w)
+        for i in range(w.size(0)):
+            for j in range(s.size(0)):
+                result[i] += w[(i - j) % w.size(0)] * s[j]
+        return result
+
+    def _sharpen(self, w, gamma):
+        # Sharpening the distribution
+        w = w ** gamma
+        w = w / torch.sum(w, dim=0, keepdim=True)
         return w
 
-    def forward(self, action, hidden_state, prev_read_vector):
+    def forward(self, action, hidden_state, prev_read_weight, prev_write_weight):
         # Concatenate action and hidden state to form the input
         input = torch.cat([action, hidden_state], dim=1)
 
@@ -98,21 +122,39 @@ class Memory(nn.Module):
         read_key = self.read_head(controller_out)
         write_key = self.write_head(controller_out)
 
-        # Addressing
-        read_weight = self._addressing(read_key, self.memory)
-        write_weight = self._addressing(write_key, self.memory)
+        # Content-based addressing
+        read_weight = self._cosine_similarity(read_key, self.memory)
+        write_weight = self._cosine_similarity(write_key, self.memory)
+
+        # Interpolation Gate
+        g = torch.sigmoid(self.interpolation_gate(controller_out))
+
+        # Interpolate between previous and new weights
+        read_weight = g * read_weight + (1 - g) * prev_read_weight
+        write_weight = g * write_weight + (1 - g) * prev_write_weight
+
+        # Location-based addressing (shift and sharpen)
+        shift = F.softmax(self.shift_vector(controller_out), dim=1)
+        gamma = F.softplus(self.sharpening_factor(controller_out))
+
+        read_weight = self._sharpen(self._circular_convolution(read_weight, shift), gamma)
+        write_weight = self._sharpen(self._circular_convolution(write_weight, shift), gamma)
 
         # Read from memory
-        read_vector = torch.bmm(read_weight.unsqueeze(1), self.memory).squeeze(1)
+        read_vector = torch.mm(read_weight, self.memory)
 
         # Write to memory
-        self.memory = self._write_to_memory(write_weight, write_key, self.memory)
+        add_vec = self.add_vector(controller_out)
+        erase_vec = self.erase_vector(controller_out)
+        self.memory = self._write_to_memory(write_weight, add_vec, erase_vec, self.memory)
 
-        return read_vector
+        return read_vector, read_weight, write_weight
 
-    def _write_to_memory(self, write_weight, write_vector, memory):
-        # Simple write operation (replace content for demonstration)
-        memory = memory * (1 - write_weight.unsqueeze(-1)) + write_vector.unsqueeze(1) * write_weight.unsqueeze(-1)
+    def _write_to_memory(self, write_weight, add_vector, erase_vector, memory):
+        # Write operation with erase and add
+        erase_vector = erase_vector.unsqueeze(1)
+        add_vector = add_vector.unsqueeze(1)
+        memory = memory * (1 - write_weight.unsqueeze(-1) * erase_vector) + write_weight.unsqueeze(-1) * add_vector
         return memory
 
     def reset_memory(self):
@@ -120,82 +162,179 @@ class Memory(nn.Module):
         self.memory.fill_(0)
 
 
+
 class RenderingEngine(nn.Module):
-    def __init__(self, hidden_size, memory_size, output_channels, output_height, output_width):
+    def __init__(self, hidden_size, memory_size, output_channels):
         super(RenderingEngine, self).__init__()
         
-        # Define the input size (hidden state + memory output)
+        # Define the combined input size (hidden state + memory output)
         combined_size = hidden_size + memory_size
 
-        self.decoder = nn.Sequential(
-            # Transform the combined input to a suitable shape for transposed convolutions
-            nn.Linear(combined_size, 256),
-            nn.ReLU(),
-            nn.Unflatten(1, (256, 1, 1)),  # Reshape for transposed convolution
+        # Linear layer to transform the combined input to the latent dimension
+        self.input_layer = nn.Sequential(
+            nn.Linear(combined_size, 256 * 2 * 3),  # Adjust latent_dim accordingly
+            nn.ReLU(inplace=True)
+        )
 
-            # Transposed convolutional layers to upscale to the desired output size
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1),
-            nn.Tanh()  # Tanh activation to output pixel values in the range [-1, 1]
+        # Rest of the decoder as before
+        self.decoder = nn.Sequential(
+            nn.Unflatten(1, (256, 2, 3)),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Upsample(size=(50, 75)),
+            nn.Conv2d(32, output_channels, kernel_size=3, stride=1, padding=1),
+            nn.Tanh()
         )
 
     def forward(self, hidden_state, memory_output):
-        # Combine the hidden state and memory output
+        # Combine the hidden state and memory output and process through input_layer
         combined_input = torch.cat([hidden_state, memory_output], dim=1)
+        latent_input = self.input_layer(combined_input)
 
-        # Decode the combined input into an image
-        frame = self.decoder(combined_input)
+        # Decode the latent input into an image
+        frame = self.decoder(latent_input)
         return frame
 
+
 class SingleImageDiscriminator(nn.Module):
-    def __init__(self, input_channels):
+    def __init__(self, input_channels, input_height, input_width):
         super(SingleImageDiscriminator, self).__init__()
-        # Example architecture
-        self.model = nn.Sequential(
+        self.conv_layers = nn.Sequential(
             nn.Conv2d(input_channels, 64, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            # Additional convolutional layers...
-            nn.Conv2d(64, 1, kernel_size=4, stride=1, padding=0),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten()
+        )
+
+        # Dynamically calculate the input size for the linear layer
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, input_channels, input_height, input_width)
+            conv_output_size = self.conv_layers(dummy_input).shape[1]
+        
+        self.fc = nn.Sequential(
+            nn.Linear(conv_output_size, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        return self.model(x)
+        conv_out = self.conv_layers(x)
+        return self.fc(conv_out)
+
 
 
 class TemporalDiscriminator(nn.Module):
     def __init__(self, input_channels, sequence_length):
         super(TemporalDiscriminator, self).__init__()
-        # Example architecture (assumes input is a sequence of frames)
+        # Architecture with 3D convolutions
         self.model = nn.Sequential(
             nn.Conv3d(input_channels, 64, kernel_size=(sequence_length, 4, 4), stride=(1, 2, 2), padding=(0, 1, 1)),
             nn.LeakyReLU(0.2, inplace=True),
-            # Additional 3D convolutional layers...
-            nn.Conv3d(64, 1, kernel_size=(1, 4, 4), stride=1, padding=0),
+            nn.Conv3d(64, 128, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(128, 256, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(256, 512, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(512, 1, kernel_size=(1, 4, 4), stride=(1, 1, 1), padding=(0, 1, 1)),
+            nn.AdaptiveAvgPool3d((1, 1, 1)),  # Adaptive pooling to get a fixed size output
+            nn.Flatten(),
+            nn.Linear(512, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
+        # x is expected to be a tensor of shape (batch, channels, sequence_length, height, width)
         return self.model(x)
+
 
 class ActionConditionedDiscriminator(nn.Module):
     def __init__(self, input_channels, action_size):
         super(ActionConditionedDiscriminator, self).__init__()
-        # Adjust the input channels to accommodate two frames and an action
-        self.model = nn.Sequential(
-            nn.Conv2d(input_channels * 2 + action_size, 64, kernel_size=4, stride=2, padding=1),
+        # Define the architecture
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(input_channels * 2, 64, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            # Additional convolutional layers...
-            nn.Conv2d(64, 1, kernel_size=4, stride=1, padding=0),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten()
+        )
+
+        # Calculate the output size of the convolutional layers dynamically
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, input_channels * 2, 64, 64)  # Assuming a 64x64 input size
+            conv_output_size = self.conv_layers(dummy_input).shape[1]
+
+        # Fully connected layers to integrate action information
+        self.fc_layers = nn.Sequential(
+            nn.Linear(conv_output_size + action_size, 1024),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(1024, 1),
             nn.Sigmoid()
         )
 
     def forward(self, frame1, frame2, action):
-        # Concatenate the frames and action
-        # Assuming action is a one-hot encoded vector and needs to be expanded to match frame dimensions
-        action = action.view(action.size(0), action.size(1), 1, 1).expand(-1, -1, frame1.size(2), frame1.size(3))
-        combined_input = torch.cat([frame1, frame2, action], dim=1)
-        return self.model(combined_input)
+        # Concatenate the frames
+        combined_frames = torch.cat([frame1, frame2], dim=1)
+
+        # Process the concatenated frames through convolutional layers
+        conv_out = self.conv_layers(combined_frames)
+
+        # Flatten the action and concatenate it with the conv_out
+        action = action.view(action.size(0), -1)
+        combined_input = torch.cat([conv_out, action], dim=1)
+
+        # Pass the combined input through fully connected layers
+        return self.fc_layers(combined_input)
+
+
+class GameOverDiscriminator(nn.Module):
+    def __init__(self, input_channels, input_height, input_width):
+        super(GameOverDiscriminator, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(input_channels, 64, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Flatten()
+        )
+
+        # Dynamically calculate the input size for the linear layer
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, input_channels, input_height, input_width)
+            conv_output_size = self.conv_layers(dummy_input).shape[1]
+        
+        self.fc = nn.Sequential(
+            nn.Linear(conv_output_size, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        conv_out = self.conv_layers(x)
+        return self.fc(conv_out)
