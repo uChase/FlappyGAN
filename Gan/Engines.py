@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# THE IMAGE IS GOING TO BE 50 X 75
+# THE IMAGE IS GOING TO BE 75 X 50
 
 class DynamicsEngine(nn.Module):
     def __init__(self, action_size, noise_size, memory_size, frame_channels, frame_height, frame_width, hidden_size, num_layers, output_size):
@@ -25,7 +25,8 @@ class DynamicsEngine(nn.Module):
 
         # MLP for combining action, noise, memory, and CNN output
         self.mlp = nn.Sequential(
-            nn.Linear(action_size + noise_size + memory_size + self.flattened_size, hidden_size),
+            #HARD CODED CAUSE IM GOING CRAZY!!
+            nn.Linear(4566, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size)
         )
@@ -40,18 +41,29 @@ class DynamicsEngine(nn.Module):
         self.num_layers = num_layers
 
     def forward(self, frame, action, noise, prev_memory, prev_hidden):
+
+        action = action.view(1, -1)
+
+        noise = noise.view(1, -1)
+
+        flattened_memory = prev_memory.view(-1)
+
+        flattened_memory = flattened_memory.view(1, -1)
+
         # Process frame through convolutional layers
         conv_output = self.conv_layers(frame)
 
         # Combine action, noise, prev_memory, and conv_output; then pass through MLP
-        combined_input = torch.cat([action, noise, prev_memory], dim=1)
+
+        conv_output_flattened = conv_output.view(1, -1)
+        combined_input = torch.cat([action, noise, flattened_memory, conv_output_flattened], dim=1)
         mlp_output = self.mlp(combined_input)
 
         # Element-wise multiplication with previous hidden state
         new_hidden = prev_hidden * mlp_output
 
         # Reshape and pass through GRU
-        gru_input = conv_output.unsqueeze(1)  # Add sequence length dimension
+        gru_input = mlp_output.unsqueeze(1)  # Add sequence length dimension
         out, hidden = self.gru(gru_input, new_hidden)
 
         # Pass the output of GRU to the fully connected layer
@@ -73,7 +85,7 @@ class Memory(nn.Module):
         self.memory_unit_size = memory_unit_size
 
         # Initialize the memory
-        self.memory = torch.randn(memory_units, memory_unit_size)
+        self.memory = torch.randn(memory_units, memory_unit_size).cuda()
 
         # Controller (using GRU instead of LSTM)
         self.controller = nn.GRU(action_size + hidden_size, controller_size)
@@ -91,6 +103,8 @@ class Memory(nn.Module):
 
     def _cosine_similarity(self, key, memory):
         # Cosine similarity for content-based addressing
+        key = key.to('cuda')
+        memory = memory.to('cuda')
         key = key / (key.norm(p=2, dim=1, keepdim=True) + 1e-16)
         memory = memory / (memory.norm(p=2, dim=1, keepdim=True) + 1e-16)
         similarity = torch.mm(memory, key.t())
@@ -101,8 +115,10 @@ class Memory(nn.Module):
         result = torch.zeros_like(w)
         for i in range(w.size(0)):
             for j in range(s.size(0)):
-                result[i] += w[(i - j) % w.size(0)] * s[j]
+                # Ensure that both operands are of the same shape
+                result[i] += w[(i - j) % w.size(0), 0] * s[j, 0]
         return result
+
 
     def _sharpen(self, w, gamma):
         # Sharpening the distribution
@@ -110,26 +126,38 @@ class Memory(nn.Module):
         w = w / torch.sum(w, dim=0, keepdim=True)
         return w
 
-    def forward(self, action, hidden_state, prev_read_weight, prev_write_weight):
+    def forward(self, action, hidden_state, prev_read_weight, prev_write_weight, prev_controller_hidden=None):
+        # Detach the memory tensor
+        memory = self.memory.detach()
+
         # Concatenate action and hidden state to form the input
-        input = torch.cat([action, hidden_state], dim=1)
+        action = action.view(1, -1)
+
+        hidden_state_last_layer = hidden_state[-1]
+
+        input = torch.cat([action, hidden_state_last_layer], dim=1)
+
+        if prev_controller_hidden is None:
+            prev_controller_hidden = torch.zeros(1, input.size(0), self.controller.hidden_size).detach().cuda()
 
         # Controller operations
-        controller_out, _ = self.controller(input.unsqueeze(0))
+        controller_out, new_controller_hidden = self.controller(input.unsqueeze(0), prev_controller_hidden)
         controller_out = controller_out.squeeze(0)
-
+        new_controller_hidden = new_controller_hidden.detach()
         # Read and write operations
         read_key = self.read_head(controller_out)
         write_key = self.write_head(controller_out)
 
         # Content-based addressing
-        read_weight = self._cosine_similarity(read_key, self.memory)
-        write_weight = self._cosine_similarity(write_key, self.memory)
+        read_weight = self._cosine_similarity(read_key, memory)
+        write_weight = self._cosine_similarity(write_key, memory)
 
         # Interpolation Gate
         g = torch.sigmoid(self.interpolation_gate(controller_out))
 
         # Interpolate between previous and new weights
+
+
         read_weight = g * read_weight + (1 - g) * prev_read_weight
         write_weight = g * write_weight + (1 - g) * prev_write_weight
 
@@ -139,36 +167,41 @@ class Memory(nn.Module):
 
         read_weight = self._sharpen(self._circular_convolution(read_weight, shift), gamma)
         write_weight = self._sharpen(self._circular_convolution(write_weight, shift), gamma)
-
+        memory = memory.detach()
         # Read from memory
-        read_vector = torch.mm(read_weight, self.memory)
+        read_vector = torch.mm(read_weight.transpose(0, 1), memory)
+
 
         # Write to memory
         add_vec = self.add_vector(controller_out)
         erase_vec = self.erase_vector(controller_out)
-        self.memory = self._write_to_memory(write_weight, add_vec, erase_vec, self.memory)
+        memory = self._write_to_memory(write_weight, add_vec, erase_vec, memory)
 
-        return read_vector, read_weight, write_weight
+        return read_vector, read_weight, write_weight, new_controller_hidden
 
     def _write_to_memory(self, write_weight, add_vector, erase_vector, memory):
         # Write operation with erase and add
-        erase_vector = erase_vector.unsqueeze(1)
-        add_vector = add_vector.unsqueeze(1)
-        memory = memory * (1 - write_weight.unsqueeze(-1) * erase_vector) + write_weight.unsqueeze(-1) * add_vector
+
+        memory = memory * (1 - write_weight * erase_vector) 
+
+        memory = memory + write_weight * add_vector
         return memory
 
     def reset_memory(self):
         # Reset memory
-        self.memory.fill_(0)
+        self.memory.fill_(0).detach()
+    
+    def get_memory(self):
+        return self.memory
 
 
 
 class RenderingEngine(nn.Module):
-    def __init__(self, hidden_size, memory_size, output_channels):
+    def __init__(self, output_size, read_size, output_channels):
         super(RenderingEngine, self).__init__()
         
         # Define the combined input size (hidden state + memory output)
-        combined_size = hidden_size + memory_size
+        combined_size = output_size + read_size
 
         # Linear layer to transform the combined input to the latent dimension
         self.input_layer = nn.Sequential(
@@ -218,7 +251,7 @@ class SingleImageDiscriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0),
+            nn.Conv2d(512, 1, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Flatten()
         )
@@ -238,7 +271,6 @@ class SingleImageDiscriminator(nn.Module):
         return self.fc(conv_out)
 
 
-
 class TemporalDiscriminator(nn.Module):
     def __init__(self, input_channels, sequence_length):
         super(TemporalDiscriminator, self).__init__()
@@ -253,16 +285,17 @@ class TemporalDiscriminator(nn.Module):
             nn.Conv3d(256, 512, kernel_size=(3, 4, 4), stride=(1, 2, 2), padding=(1, 1, 1)),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv3d(512, 1, kernel_size=(1, 4, 4), stride=(1, 1, 1), padding=(0, 1, 1)),
-            nn.AdaptiveAvgPool3d((1, 1, 1)),  # Adaptive pooling to get a fixed size output
-            nn.Flatten(),
-            nn.Linear(512, 1),
+            # nn.AdaptiveAvgPool3d((1, 1, 1)),  # Adaptive pooling to get a fixed size output
+            nn.Flatten()
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(6, 1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        # x is expected to be a tensor of shape (batch, channels, sequence_length, height, width)
-        return self.model(x)
-
+        conv_out = self.model(x)
+        return self.fc(conv_out)
 
 class ActionConditionedDiscriminator(nn.Module):
     def __init__(self, input_channels, action_size):
@@ -281,28 +314,30 @@ class ActionConditionedDiscriminator(nn.Module):
         )
 
         # Calculate the output size of the convolutional layers dynamically
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, input_channels * 2, 64, 64)  # Assuming a 64x64 input size
-            conv_output_size = self.conv_layers(dummy_input).shape[1]
+
 
         # Fully connected layers to integrate action information
         self.fc_layers = nn.Sequential(
-            nn.Linear(conv_output_size + action_size, 1024),
+            #THIS IS A HARD CODED IN VALUE
+            nn.Linear(6145, 1024),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(1024, 1),
             nn.Sigmoid()
         )
 
-    def forward(self, frame1, frame2, action):
-        # Concatenate the frames
-        combined_frames = torch.cat([frame1, frame2], dim=1)
+    def forward(self, combined_frames, action):
+     
 
         # Process the concatenated frames through convolutional layers
         conv_out = self.conv_layers(combined_frames)
 
         # Flatten the action and concatenate it with the conv_out
         action = action.view(action.size(0), -1)
-        combined_input = torch.cat([conv_out, action], dim=1)
+
+
+        flattened_conv = conv_out.view(1, -1)
+
+        combined_input = torch.cat([flattened_conv, action], dim=1)
 
         # Pass the combined input through fully connected layers
         return self.fc_layers(combined_input)
@@ -320,7 +355,7 @@ class GameOverDiscriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, kernel_size=4, stride=1, padding=0),
+            nn.Conv2d(512, 1, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Flatten()
         )

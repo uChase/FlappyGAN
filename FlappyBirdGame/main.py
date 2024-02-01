@@ -1,5 +1,7 @@
 import pygame
 import random
+
+import torch
 import DQN
 import numpy as np
 from collections import deque
@@ -19,8 +21,10 @@ def compress_screen_data(screen_data, compression_factor=0.125):
     # Resize using scipy's zoom function
     compressed_data = zoom(screen_data, (compression_factor, compression_factor, 1), order=0)
 
-    return compressed_data
+    compressed_tensor = torch.tensor(compressed_data, dtype=torch.float32)
 
+
+    return compressed_tensor
 # Initialize Pygame
 pygame.init()
 
@@ -28,15 +32,18 @@ pygame.init()
 screen_width = 400
 screen_height = 600
 def save_frame_data(frame_data, filename):
-    # Convert the deque or list to a numpy array
-    frame_data_array = np.array(frame_data, dtype=object)
-    np.savez_compressed(filename, frame_data=frame_data_array)
+    # Ensure frame_data is a list of tuples
+    if not isinstance(frame_data, list):
+        frame_data = list(frame_data)
 
-agent = DQN.FlappyBirdAgent(6, 2, 100000, 0)
+    # Save the list of tuples to a file using torch.save
+    torch.save(frame_data, filename)
+
+agent = DQN.FlappyBirdAgent(6, 2, 100000)
 
 total_frames = 0
 
-frame_data = deque(maxlen=5000)
+frame_data = deque()
 epochs = 100000
 
 breakOut = False
@@ -199,14 +206,20 @@ for epoch in range(epochs):
         gOver = 0
         if game_over:
             gOver = 1
-        frame_data.append((compressed_current_screen_data, action, compressed_next_screen_data, gOver))
+        frame_data.append((
+            compressed_current_screen_data,         # Already a tensor
+            torch.tensor([action], dtype=torch.float),  # Convert action to a tensor
+            compressed_next_screen_data,            # Already a tensor
+            torch.tensor([gOver], dtype=torch.float)     # Convert gOver to a tensor
+        ))
         # Check for Game Over
-        if (total_frames + 1) % 1000 == 0:
-            save_frame_data(frame_data, 'compressed_frame_data.npz')
+        if (total_frames + 1) % 100000 == 0:
+            save_frame_data(frame_data, 'compressed_frame_data_training.pt')
             frame_data.clear()
         if game_over:
             break
     agent.replay(batch_size = batch_size)
+    print(total_frames)
 
 
 agent.save_model('model.pt')
